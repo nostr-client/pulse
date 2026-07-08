@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta property="og:title" content="pulse — nostr-client">
+<meta property="og:description" content="The live heartbeat of the nostr network: events per second, kinds, hashtags, relays.">
+<meta property="og:url" content="https://nostr-client.github.io/pulse/">
+<meta property="og:image" content="https://nostr-client.github.io/pulse/og.png">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="nostr-client">
+<meta name="twitter:card" content="summary_large_image">
+<title>pulse — the nostr heartbeat</title>
+<link rel="stylesheet" href="https://nostr-client.github.io/theme/theme.css">
+<style>
+  body { max-width: 44rem; margin: 2.5rem auto; padding: 0 1.2rem 4rem; }
+  h1 { font-size: 1.4rem; } h1 a { text-decoration: none; }
+  .grid { display: grid; gap: .8rem; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); margin: 1.2rem 0; }
+  .stat { background: var(--nc-surface); border: 1px solid var(--nc-line);
+    border-radius: var(--nc-radius); padding: 1rem 1.1rem; box-shadow: var(--nc-shadow); }
+  .stat .n { font-size: 2rem; font-weight: 800; letter-spacing: -0.02em; }
+  .stat .l { font-size: .78rem; color: var(--nc-soft); text-transform: uppercase; letter-spacing: .06em; }
+  canvas { width: 100%; height: 90px; display: block; }
+  .panel { background: var(--nc-surface); border: 1px solid var(--nc-line);
+    border-radius: var(--nc-radius); padding: 1rem 1.1rem; box-shadow: var(--nc-shadow); margin: .8rem 0; }
+  .panel h2 { font-size: .78rem; color: var(--nc-soft); text-transform: uppercase;
+    letter-spacing: .06em; margin: 0 0 .6rem; }
+  .bars { display: grid; gap: .35rem; }
+  .bar { display: grid; grid-template-columns: 8rem 1fr 3rem; gap: .6rem; align-items: center;
+    font-size: .82rem; }
+  .bar .track { height: .55em; background: var(--nc-inset); border-radius: 999px; overflow: hidden; }
+  .bar .fill { height: 100%; background: var(--nc-accent); border-radius: 999px;
+    transition: width .5s ease; }
+  .bar .val { text-align: right; color: var(--nc-soft); font-variant-numeric: tabular-nums; }
+  .bar .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .relays { display: flex; flex-wrap: wrap; gap: .5rem; font-size: .8rem; }
+  .relay { display: inline-flex; align-items: center; gap: .4em; padding: .3em .8em;
+    background: var(--nc-inset); border-radius: 999px; font-family: var(--nc-mono); font-size: .75rem; }
+  .dot { width: .5em; height: .5em; border-radius: 50%; background: var(--nc-faint); }
+  .dot.open { background: var(--nc-ok); }
+  .dot.connecting { background: #d9a514; }
+</style>
+</head>
+<body>
+<h1><a href="https://github.com/nostr-client/pulse">nostr-client / pulse</a></h1>
+<p class="nc-muted">The live heartbeat of nostr, straight from the shared
+relay pool — no backend, no API keys, just websockets in your tab.</p>
+
+<div class="grid">
+  <div class="stat"><div class="n" id="total">0</div><div class="l">events this session</div></div>
+  <div class="stat"><div class="n" id="rate">0.0</div><div class="l">events / second</div></div>
+  <div class="stat"><div class="n" id="people">0</div><div class="l">unique authors</div></div>
+</div>
+
+<div class="panel">
+  <h2>events per second — last 90s</h2>
+  <canvas id="chart" width="900" height="90"></canvas>
+</div>
+
+<div class="panel">
+  <h2>event kinds</h2>
+  <div class="bars" id="kinds"></div>
+</div>
+
+<div class="panel">
+  <h2>hashtags right now</h2>
+  <div class="bars" id="tags"></div>
+</div>
+
+<div class="panel">
+  <h2>relays</h2>
+  <div class="relays" id="relays"></div>
+</div>
+
+<script type="module">
+  import { defaultPool } from 'https://nostr-client.github.io/pool/pool.js'
+
+  const KIND_NAMES = { 0: 'profiles', 1: 'notes', 3: 'contacts', 5: 'deletes', 6: 'reposts',
+    7: 'reactions', 1059: 'gift wraps', 1311: 'live chat', 9735: 'zap receipts',
+    10002: 'relay lists', 30023: 'articles', 30315: 'statuses', 34550: 'communities' }
+
+  const $ = (id) => document.getElementById(id)
+  const pool = defaultPool()
+  let total = 0
+  const authors = new Set()
+  const kinds = new Map()
+  const tags = new Map()
+  const buckets = new Array(90).fill(0) // per-second ring buffer
+  let bucketNow = Math.floor(Date.now() / 1000)
+
+  pool.subscribe([{ kinds: [0, 1, 3, 5, 6, 7, 1059, 1311, 9735, 10002, 30023, 30315], limit: 0 }], {
+    onEvent: (ev) => {
+      total++
+      authors.add(ev.pubkey)
+      kinds.set(ev.kind, (kinds.get(ev.kind) ?? 0) + 1)
+      for (const t of ev.tags) {
+        if (t[0] === 't' && t[1] && t[1].length < 30) {
+          const tag = t[1].toLowerCase()
+          tags.set(tag, (tags.get(tag) ?? 0) + 1)
+        }
+      }
+      const now = Math.floor(Date.now() / 1000)
+      while (bucketNow < now) { bucketNow++; buckets.push(0); buckets.shift() }
+      buckets[buckets.length - 1]++
+    },
+  })
+
+  function bars(el, entries, nameFor) {
+    const top = entries.sort((a, b) => b[1] - a[1]).slice(0, 8)
+    const max = top[0]?.[1] ?? 1
+    el.innerHTML = ''
+    for (const [key, count] of top) {
+      const bar = document.createElement('div')
+      bar.className = 'bar'
+      const name = document.createElement('span')
+      name.className = 'name'
+      name.textContent = nameFor(key)
+      const track = document.createElement('div')
+      track.className = 'track'
+      const fill = document.createElement('div')
+      fill.className = 'fill'
+      fill.style.width = (100 * count / max) + '%'
+      track.append(fill)
+      const val = document.createElement('span')
+      val.className = 'val'
+      val.textContent = count
+      bar.append(name, track, val)
+      el.append(bar)
+    }
+  }
+
+  function draw() {
+    const canvas = $('chart')
+    const ctx = canvas.getContext('2d')
+    const w = canvas.width, h = canvas.height
+    ctx.clearRect(0, 0, w, h)
+    const max = Math.max(4, ...buckets)
+    const step = w / buckets.length
+    const accent = getComputedStyle(document.documentElement).getPropertyValue('--nc-accent').trim() || '#7c3aed'
+    ctx.beginPath()
+    buckets.forEach((v, i) => {
+      const x = i * step
+      const y = h - (v / max) * (h - 8) - 2
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)
+    })
+    ctx.strokeStyle = accent
+    ctx.lineWidth = 2
+    ctx.stroke()
+    ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath()
+    ctx.fillStyle = accent + '22'
+    ctx.fill()
+  }
+
+  setInterval(() => {
+    const now = Math.floor(Date.now() / 1000)
+    while (bucketNow < now) { bucketNow++; buckets.push(0); buckets.shift() }
+    $('total').textContent = total.toLocaleString()
+    const last10 = buckets.slice(-11, -1).reduce((a, b) => a + b, 0)
+    $('rate').textContent = (last10 / 10).toFixed(1)
+    $('people').textContent = authors.size.toLocaleString()
+    bars($('kinds'), [...kinds.entries()], (k) => KIND_NAMES[k] ?? 'kind ' + k)
+    bars($('tags'), [...tags.entries()], (t) => '#' + t)
+    const relays = $('relays')
+    relays.innerHTML = ''
+    for (const [url, relay] of pool.relays) {
+      const chip = document.createElement('span')
+      chip.className = 'relay'
+      const dot = document.createElement('span')
+      dot.className = 'dot ' + relay.status
+      chip.append(dot, url.replace('wss://', ''))
+      relays.append(chip)
+    }
+    draw()
+  }, 1000)
+</script>
+</body>
+</html>
